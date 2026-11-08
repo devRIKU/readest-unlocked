@@ -1,0 +1,111 @@
+name: Build unlocked Readest (Windows)
+
+# Builds the Readest desktop app from source with NEXT_PUBLIC_SELF_HOSTED=true,
+# which is the desktop equivalent of the Morphe patch: it makes isSelfHosted()
+# return true, so every client-side premium gate opens (custom OpenAI-compatible
+# TTS, custom translators/dictionaries, Google Drive/WebDAV/S3 sync, offline
+# audio cache).
+#
+# Server-billed features are unaffected: Readest Voice, Readest Cloud storage,
+# translation quotas and the email inbox still require a real subscription.
+#
+# Drop this at .github/workflows/build-readest-windows.yml in your fork.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 (NSIS)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: readest-windows-x64
+
+      - name: Install dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Copy vendor libs
+        shell: bash
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      # The unlock itself. Next inlines NEXT_PUBLIC_* into the client bundle at
+      # build time, and the desktop build is a static export, so this has to be
+      # present here rather than set at runtime.
+      - name: Write .env.local
+        shell: bash
+        run: |
+          cat > apps/readest-app/.env.local <<'EOF'
+          NEXT_PUBLIC_APP_PLATFORM=tauri
+          NEXT_PUBLIC_SELF_HOSTED=true
+          EOF
+          cat apps/readest-app/.env.local
+
+      # Two config changes that only exist because this is a fork without the
+      # upstream repository's secrets:
+      #   beforeBuildCommand drops `pnpm upload-sourcemaps`, which needs a Sentry
+      #     token and runs on every build;
+      #   createUpdaterArtifacts goes false because tauri.conf.json ships a real
+      #     updater pubkey and the bundler refuses to emit updater artifacts
+      #     without the matching private key.
+      - name: Relax build config for an unsigned fork build
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = 'apps/readest-app/src-tauri/tauri.conf.json';
+            const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+            c.build.beforeBuildCommand = 'pnpm build';
+            c.bundle.createUpdaterArtifacts = false;
+            fs.writeFileSync(p, JSON.stringify(c, null, 2));
+            console.log('beforeBuildCommand:', c.build.beforeBuildCommand);
+            console.log('createUpdaterArtifacts:', c.bundle.createUpdaterArtifacts);
+          "
+
+      - name: Build
+        shell: bash
+        timeout-minutes: 60
+        env:
+          RUST_BACKTRACE: '1'
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          cd apps/readest-app
+          pnpm tauri build --bundles nsis
+
+      - name: Locate installer
+        shell: bash
+        run: |
+          ls -la target/release/bundle/nsis/ || true
+          test -n "$(ls target/release/bundle/nsis/*.exe 2>/dev/null)" \
+            || { echo "::error::no NSIS installer was produced"; exit 1; }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: Readest-windows-x64-unlocked
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error

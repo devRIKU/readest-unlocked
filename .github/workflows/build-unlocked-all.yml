@@ -48,13 +48,26 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          LATEST=$(gh api repos/readest/readest/releases/latest --jq .tag_name)
+
           if [ -n "${INPUT_VERSION}" ]; then
-            TAG="${INPUT_VERSION}"
+            # Accept "0.12.20", "v0.12.20" or "v0.12.20-unlocked".
+            VERSION="${INPUT_VERSION#v}"
+            VERSION="${VERSION%-unlocked}"
           else
-            TAG=$(gh api repos/readest/readest/releases/latest --jq .tag_name)
+            VERSION="${LATEST#v}"
           fi
-          [ -n "$TAG" ] || { echo "::error::could not resolve a tag"; exit 1; }
-          VERSION="${TAG#v}"
+
+          # A tag that does not exist upstream would otherwise fail five
+          # checkouts in a row with an unhelpful git exit code.
+          if ! gh api "repos/readest/readest/git/ref/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::no upstream tag v${VERSION} (latest release is ${LATEST})."
+            echo "Recent tags:"
+            gh api repos/readest/readest/tags --jq '.[0:8][].name' || true
+            exit 1
+          fi
+
+          TAG="v${VERSION}"
           echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 

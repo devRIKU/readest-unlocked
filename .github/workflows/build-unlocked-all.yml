@@ -5,8 +5,12 @@ name: Build unlocked Readest (all platforms)
 # equivalent of the Morphe patch) and publishes everything to this fork's
 # Releases.
 #
-# Runs daily at 03:00 UTC and on demand. If a release for the detected version
-# already exists here, every build job is skipped, so the schedule is cheap.
+# Polls hourly and runs on demand. If a release for the detected version already
+# exists here, every build job is skipped, so a poll that finds nothing is cheap.
+#
+# Note: GitHub disables scheduled workflows after 60 days without repository
+# activity. Any push resets that, so if the fork goes quiet for two months the
+# cron stops and has to be re-enabled from the Actions tab.
 #
 # Platforms: Windows x64, macOS universal, Linux x86_64 (CEF AppImage), Android
 # arm64, plus the KOReader / Calibre / CrossPoint plugin zips.
@@ -14,8 +18,13 @@ name: Build unlocked Readest (all platforms)
 # iOS is NOT here on purpose - see the note at the bottom.
 
 on:
+  # GitHub has no "watch another repo" trigger, so poll. `resolve` exits in
+  # about 15 seconds when the latest upstream tag already has a release here,
+  # which makes an hourly check essentially free on a public repo.
+  # Shortest GitHub allows is 5 minutes; under load scheduled runs are often
+  # delayed, so going below hourly buys little and wakes the runner a lot.
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       version:

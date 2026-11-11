@@ -1,0 +1,407 @@
+name: Build unlocked Readest (all platforms)
+
+# Watches readest/readest for a new release and, when one appears, builds the
+# app from that exact tag with NEXT_PUBLIC_SELF_HOSTED=true (the desktop/Android
+# equivalent of the Morphe patch) and publishes everything to this fork's
+# Releases.
+#
+# Runs daily at 03:00 UTC and on demand. If a release for the detected version
+# already exists here, every build job is skipped, so the schedule is cheap.
+#
+# Platforms: Windows x64, macOS universal, Linux x86_64 (CEF AppImage), Android
+# arm64, plus the KOReader / Calibre / CrossPoint plugin zips.
+#
+# iOS is NOT here on purpose - see the note at the bottom.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream tag to build (e.g. v0.12.20). Blank = latest release.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-unlocked
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- resolve
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - name: Work out which tag to build
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            TAG="${INPUT_VERSION}"
+          else
+            TAG=$(gh api repos/readest/readest/releases/latest --jq .tag_name)
+          fi
+          [ -n "$TAG" ] || { echo "::error::could not resolve a tag"; exit 1; }
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if gh release view "${TAG}-unlocked" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release ${TAG}-unlocked already exists; nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Will build ${VERSION}."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ------------------------------------------------------------ app builds
+  app:
+    name: ${{ matrix.name }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            artifact: readest-windows-x64
+            args: '--bundles nsis'
+            paths: target/release/bundle/nsis/*.exe
+            rust_targets: x86_64-pc-windows-msvc
+          - name: macOS universal
+            os: macos-latest
+            artifact: readest-macos-universal
+            args: '--target universal-apple-darwin --bundles dmg'
+            paths: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            rust_targets: x86_64-apple-darwin,aarch64-apple-darwin
+          - name: Linux x86_64 (CEF)
+            os: ubuntu-22.04
+            artifact: readest-linux-x86_64
+            args: '--bundles appimage'
+            paths: target/release/bundle/appimage/*.AppImage
+            rust_targets: x86_64-unknown-linux-gnu
+            cef: true
+          - name: Android arm64
+            os: ubuntu-latest
+            artifact: readest-android-arm64
+            android: true
+            android_args: '-t aarch64'
+            paths: apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+            rust_targets: aarch64-linux-android
+
+    steps:
+      # Build straight from the upstream tag rather than from the fork, so a
+      # new upstream release needs no manual sync.
+      - name: Checkout upstream at ${{ needs.resolve.outputs.tag }}
+        uses: actions/checkout@v7
+        with:
+          repository: readest/readest
+          ref: ${{ needs.resolve.outputs.tag }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Java (Android)
+        if: matrix.android
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Setup Android SDK
+        if: matrix.android
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: matrix.android
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.artifact }}
+
+      - name: Install Linux build deps
+        if: matrix.cef
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libclang-dev g++ libfontconfig-dev \
+            libgtk-3-dev libwebkit2gtk-4.1 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1 \
+            libjavascriptcoregtk-4.1-dev gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 \
+            libappindicator3-dev librsvg2-dev patchelf xdg-utils \
+            libnss3 libpulse0 libspeechd2 libxkbcommon-x11-0
+
+      # Linux is the only platform on the CEF runtime; the npm CLI's CEF
+      # bundle ships a broken quick-sharun fork, so build the CLI from
+      # readest/tauri. Bump `rev` if upstream moves it (see their release.yml).
+      - name: Install CEF tauri CLI (Linux)
+        if: matrix.cef
+        run: |
+          set -euo pipefail
+          rev=6beeb209b5514f597a26f48b7a5b9fe4c59b5f12
+          cargo install tauri-cli --git https://github.com/readest/tauri --rev "$rev" --locked --force
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Copy vendor libs
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Prepare Android project
+        if: matrix.android
+        shell: bash
+        run: |
+          cd apps/readest-app
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          # Discards the files `tauri android init` rewrote. Must run before the
+          # config patch below, or it would revert it.
+          git checkout .
+
+      # The unlock. Next inlines NEXT_PUBLIC_* at build time and every desktop /
+      # mobile build is a static export, so this has to be set before compiling.
+      - name: Write .env.local
+        shell: bash
+        run: |
+          cat > apps/readest-app/.env.local <<'EOF'
+          NEXT_PUBLIC_APP_PLATFORM=tauri
+          NEXT_PUBLIC_SELF_HOSTED=true
+          EOF
+
+      # Two edits that exist only because this is an unsigned fork build:
+      # drop the Sentry sourcemap upload (no token) and turn off updater
+      # artifacts (the config ships a real updater pubkey, and the bundler
+      # refuses to emit them without the matching private key).
+      - name: Patch build config
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = 'apps/readest-app/src-tauri/tauri.conf.json';
+            const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+            c.build.beforeBuildCommand = 'pnpm build';
+            c.bundle.createUpdaterArtifacts = false;
+            fs.writeFileSync(p, JSON.stringify(c, null, 2));
+          "
+
+      - name: Stage Linux runtime libs
+        if: matrix.cef
+        run: |
+          set -euo pipefail
+          nss_dir=$(dirname "$(ls /usr/lib/*-linux-gnu/nss/libsoftokn3.so)")
+          lib_dir=${nss_dir%/nss}
+          sudo cp -f --remove-destination "$nss_dir"/*.so "$lib_dir/"
+          conf=apps/readest-app/src-tauri/tauri.conf.json
+          jq --arg d "$lib_dir" '.bundle.linux.appimage.files += {
+              "/usr/lib/libspeechd.so.2": ($d + "/libspeechd.so.2"),
+              "/usr/lib/libxkbcommon-x11.so.0": ($d + "/libxkbcommon-x11.so.0")
+            }' "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+
+      - name: Build Android
+        if: matrix.android
+        shell: bash
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          keyfile="$RUNNER_TEMP/keystore.jks"
+          if [ -n "${{ secrets.ANDROID_KEY_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEY_BASE64 }}" | base64 -d > "$keyfile"
+            alias="${{ secrets.ANDROID_KEY_ALIAS }}"
+            pass="${{ secrets.ANDROID_KEY_PASSWORD }}"
+          else
+            echo "::warning::ANDROID_KEY_BASE64 not set - signing with a throwaway key. Each new build needs an uninstall first."
+            keytool -genkeypair -keystore "$keyfile" -alias readest -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass readest123 -keypass readest123 \
+              -dname "CN=Readest Unlocked"
+            alias=readest
+            pass=readest123
+          fi
+          pushd src-tauri/gen/android
+          echo "keyAlias=$alias"     > keystore.properties
+          echo "password=$pass"     >> keystore.properties
+          echo "storeFile=$keyfile" >> keystore.properties
+          popd
+          pnpm tauri android build ${{ matrix.android_args }}
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk \
+             "Readest_${{ needs.resolve.outputs.version }}_arm64-unlocked.apk"
+
+      - name: Build desktop
+        if: ${{ !matrix.android }}
+        shell: bash
+        timeout-minutes: 75
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          RUST_BACKTRACE: '1'
+          TAURI_CEF_CARGO: ${{ matrix.cef && '1' || '' }}
+          STRACE_MODE: '0'
+        run: |
+          cd apps/readest-app
+          pnpm tauri build ${{ matrix.args }}
+
+      - name: Collect assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "${{ matrix.android }}" = "true" ]; then
+            cp apps/readest-app/Readest_*.apk dist/ 2>/dev/null || true
+          else
+            for f in ${{ matrix.paths }}; do [ -e "$f" ] && cp "$f" dist/; done
+          fi
+          ls -la dist
+          test -n "$(ls -A dist)" || { echo "::error::no build output for ${{ matrix.name }}"; exit 1; }
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- plugins
+  plugins:
+    name: Plugins (KOReader, Calibre, CrossPoint)
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout upstream at ${{ needs.resolve.outputs.tag }}
+        uses: actions/checkout@v7
+        with:
+          repository: readest/readest
+          ref: ${{ needs.resolve.outputs.tag }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabi,aarch64-unknown-linux-musl
+
+      - name: Build KOReader LocalSend helper binaries
+        run: |
+          set -euo pipefail
+          pip3 install --break-system-packages --require-hashes -r .github/requirements/zigbuild.txt
+          node apps/readest.koplugin/scripts/build-localsend-bins.mjs --only armv7
+          node apps/readest.koplugin/scripts/build-localsend-bins.mjs --only arm64
+
+      - name: Package plugins
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.version }}"
+          mkdir -p dist
+
+          # KOReader: stamp the version and drop dev-only folders.
+          perl -i -pe "s/^}/    version = \"${version}\",\n}/" apps/readest.koplugin/_meta.lua
+          ( cd apps && zip -qr "../dist/Readest-${version}-1.koplugin.zip" readest.koplugin \
+              -x 'readest.koplugin/scripts/*' 'readest.koplugin/docs/*' \
+                 'readest.koplugin/spec/*' 'readest.koplugin/.busted' 'readest.koplugin/native/*' )
+
+          # Calibre
+          version_tuple=$(echo "${version}" | awk -F. '{printf "(%d, %d, %d)", $1, $2, $3}')
+          perl -i -pe "s/^PLUGIN_VERSION = \(\d+, \d+, \d+\)/PLUGIN_VERSION = ${version_tuple}/" \
+            apps/readest-calibre-plugin/__init__.py
+          make -C apps/readest-calibre-plugin zip
+          cp "apps/readest-calibre-plugin/dist/Readest-${version}.calibre-plugin.zip" dist/
+
+          # CrossPoint
+          ( cd apps/readest-crosspoint-plugin
+            jq --arg v "${version}" '.version = $v' readest/manifest.json > m.tmp && mv m.tmp readest/manifest.json
+            jq --arg v "${version}" '.description = "Version \($v). \(.description)"' \
+              readest/device.json > d.tmp && mv d.tmp readest/device.json
+            cp README.md readest/README.md
+            zip -qr "../../dist/Readest-${version}.crosspoint-plugin.zip" readest )
+
+          ls -la dist
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: readest-plugins
+          path: dist/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- release
+  release:
+    name: Publish release
+    needs: [resolve, app, plugins]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build outputs
+        uses: actions/download-artifact@v7
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}-unlocked
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -la assets
+          gh release create "$TAG" --repo "$REPO" \
+            --title "Readest ${VERSION} - unlocked" \
+            --notes "Built from readest/readest \`${TAG%-unlocked}\` with \`NEXT_PUBLIC_SELF_HOSTED=true\`.
+
+          Opens the on-device premium features: custom OpenAI-compatible TTS, custom translators and dictionaries, Google Drive / WebDAV / S3 / OneDrive sync, offline Read-Aloud caching, Nearby pairing.
+
+          Not included, because they cost Readest money per request: Readest Voice, Readest Cloud storage, translation and TTS quotas, the email inbox.
+
+          Unsigned builds - Windows will show SmartScreen, macOS needs right-click > Open. No auto-update; install the next release over this one." \
+            assets/*
+
+# ---------------------------------------------------------------------------
+# Why there is no iOS job
+#
+# Readest does not build iOS in CI at all - there is no iOS leg in release.yml
+# or nightly.yml, only macOS. An iOS build needs an Apple Developer certificate
+# and a provisioning profile for the target device; an unsigned .ipa cannot be
+# installed on a stock iPhone. With a paid Apple Developer account ($99/yr) you
+# can add a macos runner job running `pnpm tauri ios build` with APPLE_CERTIFICATE,
+# APPLE_SIGNING_IDENTITY, APPLE_TEAM_ID and a provisioning profile secret. Without
+# one, sideloading tools (AltStore, Sideloadly) re-sign an unsigned build with a
+# free 7-day certificate - that needs a build with `--export-method` set to skip
+# signing, and the result expires weekly.
+# ---------------------------------------------------------------------------

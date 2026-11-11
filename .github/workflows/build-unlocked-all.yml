@@ -80,11 +80,14 @@ jobs:
           echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          if gh release view "${TAG}-unlocked" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release ${TAG}-unlocked already exists; nothing to do."
+          # Skip only when a *published* release exists. A draft means a previous
+          # run only got some platforms built, so it has to be retried.
+          STATE=$(gh release view "${TAG}-unlocked" --repo "$REPO" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+          if [ "$STATE" = "false" ]; then
+            echo "Release ${TAG}-unlocked is published; nothing to do."
             echo "build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Will build ${VERSION}."
+            echo "Will build ${VERSION} (release state: ${STATE})."
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -388,11 +391,15 @@ jobs:
   release:
     name: Publish release
     needs: [resolve, app, plugins]
-    if: needs.resolve.outputs.build == 'true'
+    # Publish whatever built, even if one platform failed, so a broken leg does
+    # not withhold the others. An incomplete set goes out as a draft; the next
+    # run re-uploads the assets and flips it live once every platform passes.
+    if: always() && needs.resolve.result == 'success' && needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download all build outputs
         uses: actions/download-artifact@v7
+        continue-on-error: true
         with:
           path: assets
           merge-multiple: true
@@ -403,19 +410,51 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
           TAG: ${{ needs.resolve.outputs.tag }}-unlocked
           REPO: ${{ github.repository }}
+          APP_RESULT: ${{ needs.app.result }}
+          PLUGINS_RESULT: ${{ needs.plugins.result }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          files=(assets/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::no build artifacts were produced; nothing to publish"
+            exit 0
+          fi
           ls -la assets
-          gh release create "$TAG" --repo "$REPO" \
-            --title "Readest ${VERSION} - unlocked" \
-            --notes "Built from readest/readest \`${TAG%-unlocked}\` with \`NEXT_PUBLIC_SELF_HOSTED=true\`.
+
+          complete=true
+          [ "$APP_RESULT" = "success" ] || complete=false
+          [ "$PLUGINS_RESULT" = "success" ] || complete=false
+
+          notes="Built from readest/readest \`${TAG%-unlocked}\` with \`NEXT_PUBLIC_SELF_HOSTED=true\`.
 
           Opens the on-device premium features: custom OpenAI-compatible TTS, custom translators and dictionaries, Google Drive / WebDAV / S3 / OneDrive sync, offline Read-Aloud caching, Nearby pairing.
 
           Not included, because they cost Readest money per request: Readest Voice, Readest Cloud storage, translation and TTS quotas, the email inbox.
 
-          Unsigned builds - Windows will show SmartScreen, macOS needs right-click > Open. No auto-update; install the next release over this one." \
-            assets/*
+          Unsigned builds - Windows will show SmartScreen, macOS needs right-click > Open. No auto-update; install the next release over this one."
+
+          if [ "$complete" = false ]; then
+            notes="$notes
+
+          PARTIAL BUILD: app=$APP_RESULT plugins=$PLUGINS_RESULT. Published as a draft; it is replaced once every platform builds."
+            echo "::warning::partial build - publishing as a draft"
+          fi
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Updating existing release $TAG"
+            gh release upload "$TAG" "${files[@]}" --clobber --repo "$REPO"
+            if [ "$complete" = true ]; then
+              gh release edit "$TAG" --draft=false --repo "$REPO"
+              echo "All platforms built - release is live."
+            fi
+          else
+            args=(--title "Readest ${VERSION} - unlocked" --notes "$notes")
+            if [ "$complete" = false ]; then
+              args+=(--draft)
+            fi
+            gh release create "$TAG" "${files[@]}" --repo "$REPO" "${args[@]}"
+          fi
 
 # ---------------------------------------------------------------------------
 # Why there is no iOS job
